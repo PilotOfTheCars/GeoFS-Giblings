@@ -1,0 +1,8 @@
+GIBLINGS 1.0.1 — AVATAR ARM PATCH
+Owner: PilotOfTheCars
+
+- Replaced each multi-ball arm chain with ONE literal floating sphere per arm.
+- Each arm sphere follows the tracked wrist/hand pair, biased toward the hand.
+- Marshalling wands still use wrist -> hand direction for orientation.
+- Head/eye tracking, multiplayer arm sync, marshalling recognition, voice chat and boarding are unchanged.
+- Marshalling remains VERY EARLY ACCESS. BUGS WILL be present.
