@@ -1,0 +1,99 @@
+name: Apply Giblings 1.0.2 hotfix
+
+on:
+  push:
+    paths:
+      - .github/workflows/giblings-1-0-2-hotfix.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-hotfix:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build and validate Giblings 1.0.2
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Refuse to patch an unexpected source. This SHA is the exact 1.0.1
+          # blob that was used to build and locally validate the hotfix.
+          test "$(git hash-object Giblings_1.0.1_Public.user.js)" = "121b599afb1e44bb26be74eb88250cd6b769f98a"
+
+          cp Giblings_1.0.1_Public.user.js Giblings_1.0.2_Public.user.js
+          patch -p1 < .giblings-hotfix-1.0.2.patch
+
+          node --check Giblings_1.0.2_Public.user.js
+          test "$(sha256sum Giblings_1.0.2_Public.user.js | awk '{print $1}')" = "d84178e061abe82173d729f4fe56ce85006063b23921ea9437750a8d93b5f4d6"
+          grep -q "@version      1.0.2" Giblings_1.0.2_Public.user.js
+          grep -q "reliable: true" Giblings_1.0.2_Public.user.js
+          ! grep -q "remoteMarkerTimeoutMs" Giblings_1.0.2_Public.user.js
+          ! grep -q "reliable: false" Giblings_1.0.2_Public.user.js
+
+      - name: Update release notes
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          readme = Path('README.md')
+          text = readme.read_text(encoding='utf-8')
+          old_install = '`Giblings_1.0.1_Public.user.js`'
+          old_version = 'Current public build: **Giblings 1.0.1**.'
+          anchor = "`Alt + N` joins the Giblings public P2P layer. Compatible clients can share Gibling presence, position/state, colour, display name, head direction, compact arm pose and marshalling state.\n\nThe **SOCIAL** tab contains Giblings text chat and proximity voice. This is separate from GeoFS chat."
+          replacement = "`Alt + N` joins the Giblings public P2P layer. Compatible clients can share Gibling presence, position/state, colour, display name, head direction, compact arm pose and marshalling state.\n\n### 1.0.2 multiplayer recovery\n\nVersion 1.0.2 hardens multiplayer presence against temporary packet gaps, background-tab throttling and reconnects. Remote Giblings now move through ACTIVE, STALE and DISCONNECTED recovery states instead of being permanently deleted after a short timeout. A low-rate heartbeat, periodic host snapshots, reliable PeerJS data transport, immediate reconnect re-announcement and persistent-ID migration allow a returning Gibling to recover without reloading GeoFS or toggling the network off and on.\n\nThe **SOCIAL** tab contains Giblings text chat and proximity voice. This is separate from GeoFS chat."
+
+          if old_install not in text:
+              raise SystemExit('README install reference did not match expected 1.0.1 text')
+          if old_version not in text:
+              raise SystemExit('README version reference did not match expected 1.0.1 text')
+          if anchor not in text:
+              raise SystemExit('README multiplayer section did not match expected text')
+
+          text = text.replace(old_install, '`Giblings_1.0.2_Public.user.js`', 1)
+          text = text.replace(old_version, 'Current public build: **Giblings 1.0.2**.', 1)
+          text = text.replace(anchor, replacement, 1)
+          readme.write_text(text, encoding='utf-8')
+
+          changelog = Path('CHANGELOG.txt')
+          previous = changelog.read_text(encoding='utf-8').lstrip()
+          current = """GIBLINGS 1.0.2 — MULTIPLAYER PERSISTENCE / RECOVERY HOTFIX
+
+- Replaced the destructive 3.5-second remote-presence timeout with staged ACTIVE → STALE → DISCONNECTED recovery.
+- Remote presence is cached for up to two minutes unless the host receives an explicit peer-left event.
+- Added a low-rate background heartbeat so tab throttling is much less likely to make a Gibling vanish.
+- Added periodic host presence snapshots so clients can self-heal after missed updates.
+- Switched the client PeerJS data connection to reliable transport.
+- Re-announces local presence immediately when a client reconnects.
+- Uses persistent Giblings public IDs to migrate avatars across changing PeerJS transport IDs and avoid reconnect ghosts.
+- Added generation/connection guards so late close/data events from superseded transports cannot tear down a newer connection.
+- Added ACTIVE / STALE / DISCONNECTED counts and recovery information to diagnostics.
+- GeoFS native multiplayer remains untouched; this changes only the separate Giblings P2P layer.
+
+---
+
+"""
+          changelog.write_text(current + previous, encoding='utf-8')
+          PY
+
+      - name: Publish hotfix
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The patch/workflow are one-shot scaffolding; the public branch only
+          # keeps the finished userscript and release documentation.
+          rm -f .giblings-hotfix-1.0.2.patch .github/workflows/giblings-1-0-2-hotfix.yml
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "release: Giblings 1.0.2 multiplayer recovery hotfix"
+          git push
