@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Giblings 1.0.2 — Multiplayer Recovery Hotfix
+// @name         Giblings 1.0.2 — Public Release
 // @namespace    https://github.com/PilotOfTheCars/Giblings
 // @version      1.0.2
 // @description  Giblings 1.0.2 for GeoFS 3.9: multiplayer persistence/recovery hotfix plus first-person walking, passenger boarding, proximity voice, live arms, and early-access marshalling.
@@ -16,7 +16,7 @@
   'use strict';
 
   /*
-   * GIBLINGS 1.0.2 — MULTIPLAYER RECOVERY HOTFIX
+   * GIBLINGS 1.0.2 — PUBLIC RELEASE
    * -----------------
    * Scope on purpose:
    *   - GeoFS 3.9 only
@@ -38,6 +38,12 @@
    *   Alt + X  PANIC STOP
    *   F9     Toggle diagnostics panel
    *   F8     PANIC STOP GIBLINGS (reload page to re-arm)
+   *
+   * 1.0.2 multiplayer hotfix:
+   *   - reliable PeerJS data transport
+   *   - staged ACTIVE/STALE/HIDDEN/EXPIRED presence lifecycle
+   *   - periodic authoritative room snapshots and immediate reconnect reannounce
+   *   - persistent publicId migration across PeerJS transport-id changes
    *
    * Design note:
    * This implementation is written independently. Public GeoFS/Cesium research and
@@ -84,12 +90,11 @@
     giblingEyeForwardFactor: 0.93,
     markerHeightOffsetM: 0.035,
 
-    // Multiplayer presence recovery. A short packet gap must never permanently
-    // delete a Gibling. ACTIVE entries become STALE, then hidden while cached,
-    // and are only expired after a long grace period or an explicit peer-left.
+    // Multiplayer persistence/recovery (1.0.2). A short packet gap must never
+    // permanently delete another Gibling. ACTIVE -> STALE -> HIDDEN -> EXPIRED.
     remotePresenceStaleMs: 7000,
-    remotePresenceHideMs: 30000,
-    remotePresenceExpireMs: 120000,
+    remotePresenceHideMs: 15000,
+    remotePresenceExpireMs: 60000,
 
     // Marshalling rig. Pose Landmarker gives shoulders/elbows/wrists plus
     // thumb/index/pinky landmarks; that is enough to reconstruct arm motion and
@@ -115,7 +120,6 @@
     // Giblings public networking. The network is opt-in and never modifies
     // GeoFS multiplayer packets/state. PeerJS is used only for Giblings state.
     networkBroadcastMs: 100,
-    networkHeartbeatMs: 1000,
     networkSnapshotMs: 4000,
     networkReconnectMs: 1200,
     networkMaxClients: 24,
@@ -342,10 +346,8 @@
       localPeerId: null,
       lastBroadcastAt: 0,
       lastSnapshotAt: 0,
-      heartbeatTimer: 0,
       reconnectTimer: 0,
       electionGeneration: 0,
-      recoveries: 0,
       error: ''
     },
     tracking: {
@@ -1222,18 +1224,18 @@
   }
 
   function log(...args) {
-    console.log('[Giblings 1.0.0]', ...args);
+    console.log('[Giblings 1.0.2]', ...args);
   }
 
   function warn(...args) {
-    console.warn('[Giblings 1.0.0]', ...args);
+    console.warn('[Giblings 1.0.2]', ...args);
   }
 
   function recordError(error, context = 'runtime') {
     const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
     state.lastError = `${context}: ${message}`;
     state.lastErrorAt = nowMs();
-    console.error('[Giblings 1.0.0]', context, error);
+    console.error('[Giblings 1.0.2]', context, error);
     updateUi();
   }
 
@@ -2153,15 +2155,7 @@
     }
   }
 
-  function migrateRemoteGiblingEntity(fromPeerId, toPeerId) {
-    if (!fromPeerId || !toPeerId || fromPeerId === toPeerId) return;
-    const handle = state.network.remoteEntities.get(fromPeerId);
-    if (!handle || state.network.remoteEntities.has(toPeerId)) return;
-    state.network.remoteEntities.delete(fromPeerId);
-    state.network.remoteEntities.set(toPeerId, handle);
-  }
-
-  function hideRemoteGiblingEntity(peerId) {
+  function hideRemotePresence(peerId) {
     const handle = state.network.remoteEntities.get(peerId);
     if (!handle) return;
     try { setPlayerModelVisible(handle.model, false); } catch (_) {}
@@ -2169,50 +2163,37 @@
     handle.visible = false;
   }
 
-  function disconnectVoicePeer(peerId) {
-    const call = state.voice.calls.get(peerId);
-    if (call) {
-      try { call.close(); } catch (_) {}
-      state.voice.calls.delete(peerId);
-    }
-    disconnectVoiceStream(peerId);
-  }
-
   function acceptRemotePresence(peerId, raw) {
-    peerId = String(peerId || '');
-    if (!peerId || peerId === String(state.network.localPeerId || '')) return false;
     const presence = sanitizePresencePacket(raw);
     if (!presence) return false;
+    const id = String(peerId);
 
-    // PeerJS IDs can change after reconnect. The persistent publicId is the
-    // Gibling identity, so migrate the cached/rendered avatar to the new
-    // transport peer instead of leaving a ghost under the old PeerJS ID.
-    for (const [otherPeerId, entry] of state.network.remoteStates.entries()) {
-      if (otherPeerId === peerId) continue;
-      if (entry?.presence?.publicId !== presence.publicId) continue;
-      state.network.remoteStates.delete(otherPeerId);
-      migrateRemoteGiblingEntity(otherPeerId, peerId);
-      disconnectVoicePeer(otherPeerId);
+    // PeerJS assigns a new transport peer id after some reconnects. publicId is
+    // the persistent Giblings identity, so migrate away any stale transport id
+    // instead of leaving an immortal ghost or ignoring the returning player.
+    for (const [otherId, entry] of [...state.network.remoteStates.entries()]) {
+      if (String(otherId) !== id && entry?.presence?.publicId === presence.publicId) {
+        removeRemotePresence(otherId);
+      }
     }
 
-    const previous = state.network.remoteStates.get(peerId);
-    const wasRecovering = !!previous && (previous.status === 'STALE' || previous.status === 'DISCONNECTED');
-    state.network.remoteStates.set(peerId, {
+    state.network.remoteStates.set(id, {
       presence,
       receivedAt: nowMs(),
-      status: 'ACTIVE',
-      staleSince: 0,
-      hiddenSince: 0
+      stale: false,
+      hidden: false
     });
-    if (wasRecovering) state.network.recoveries += 1;
-    renderRemoteGibling(peerId, presence);
+    renderRemoteGibling(id, presence);
     return true;
   }
 
   function removeRemotePresence(peerId) {
-    state.network.remoteStates.delete(peerId);
-    removeRemoteGiblingEntity(peerId);
-    disconnectVoicePeer(peerId);
+    const id = String(peerId);
+    state.network.remoteStates.delete(id);
+    removeRemoteGiblingEntity(id);
+    disconnectVoiceStream(id);
+    const call = state.voice.calls.get(id);
+    if (call) { try { call.close(); } catch (_) {} state.voice.calls.delete(id); }
   }
 
   function clearAllRemotePresence() {
@@ -2222,48 +2203,57 @@
 
   function pruneRemotePresence() {
     const now = nowMs();
-    for (const [peerId, entry] of state.network.remoteStates.entries()) {
-      if (!entry) continue;
-      const age = now - Number(entry.receivedAt || 0);
-
+    for (const [peerId, entry] of [...state.network.remoteStates.entries()]) {
+      const age = now - Number(entry?.receivedAt || 0);
       if (age > CONFIG.remotePresenceExpireMs) {
         removeRemotePresence(peerId);
         continue;
       }
-
-      if (age > CONFIG.remotePresenceHideMs) {
-        if (entry.status !== 'DISCONNECTED') {
-          entry.status = 'DISCONNECTED';
-          entry.hiddenSince = now;
-          hideRemoteGiblingEntity(peerId);
-          disconnectVoicePeer(peerId);
-        }
-        continue;
-      }
-
-      if (age > CONFIG.remotePresenceStaleMs) {
-        if (entry.status !== 'STALE') {
-          entry.status = 'STALE';
-          entry.staleSince = now;
-        }
-      } else if (entry.status !== 'ACTIVE') {
-        entry.status = 'ACTIVE';
-        entry.staleSince = 0;
-        entry.hiddenSince = 0;
-        renderRemoteGibling(peerId, entry.presence);
+      if (age > CONFIG.remotePresenceStaleMs) entry.stale = true;
+      if (age > CONFIG.remotePresenceHideMs && !entry.hidden) {
+        entry.hidden = true;
+        hideRemotePresence(peerId);
       }
     }
   }
 
-  function networkPresenceCounts() {
-    const counts = { active: 0, stale: 0, disconnected: 0 };
+  function remotePresenceCounts() {
+    const now = nowMs();
+    let active = 0, stale = 0, hidden = 0;
     for (const entry of state.network.remoteStates.values()) {
-      const status = entry?.status || 'ACTIVE';
-      if (status === 'STALE') counts.stale += 1;
-      else if (status === 'DISCONNECTED') counts.disconnected += 1;
-      else counts.active += 1;
+      const age = now - Number(entry?.receivedAt || 0);
+      if (age > CONFIG.remotePresenceHideMs) hidden++;
+      else if (age > CONFIG.remotePresenceStaleMs) stale++;
+      else active++;
     }
-    return counts;
+    return { active, stale, hidden };
+  }
+
+  function makeNetworkSnapshot() {
+    const entries = [{ peerId: state.network.localPeerId, presence: makePresencePacket() }];
+    const now = nowMs();
+    for (const [peerId, entry] of state.network.remoteStates.entries()) {
+      if (!entry?.presence) continue;
+      // Do not let a periodic snapshot make an already-stale peer look freshly alive.
+      // Stale entries remain cached locally for recovery, but only actively-heard peers
+      // are re-advertised to the room.
+      if (now - Number(entry.receivedAt || 0) > CONFIG.remotePresenceStaleMs) continue;
+      entries.push({ peerId, presence: entry.presence });
+    }
+    return entries.slice(0, CONFIG.networkMaxClients + 1);
+  }
+
+  function broadcastNetworkSnapshot(force = false) {
+    if (state.network.role !== 'host') return;
+    const now = nowMs();
+    if (!force && now - state.network.lastSnapshotAt < CONFIG.networkSnapshotMs) return;
+    state.network.lastSnapshotAt = now;
+    hostBroadcast({
+      type: 'snapshot',
+      protocol: CONFIG.networkProtocol,
+      entries: makeNetworkSnapshot(),
+      snapshotAt: Date.now()
+    });
   }
 
   function peerCtor() {
@@ -2313,86 +2303,6 @@
         try { conn.send(message); } catch (_) {}
       }
     }
-  }
-
-  function buildPresenceSnapshotEntries() {
-    const now = nowMs();
-    const entries = [];
-    const localPresence = makePresencePacket();
-    if (state.network.localPeerId) {
-      entries.push({ peerId: state.network.localPeerId, presence: localPresence });
-    }
-    for (const [peerId, entry] of state.network.remoteStates.entries()) {
-      // Never let a periodic snapshot artificially refresh stale ghosts.
-      if (!entry?.presence || now - entry.receivedAt > CONFIG.remotePresenceStaleMs) continue;
-      entries.push({ peerId, presence: entry.presence });
-      if (entries.length >= CONFIG.networkMaxClients + 1) break;
-    }
-    return entries;
-  }
-
-  function broadcastPresenceSnapshot() {
-    if (!state.network.enabled || state.network.role !== 'host') return;
-    hostBroadcast({
-      type: 'snapshot',
-      protocol: CONFIG.networkProtocol,
-      entries: buildPresenceSnapshotEntries()
-    });
-    state.network.lastSnapshotAt = nowMs();
-  }
-
-  function sendLocalPresenceNow() {
-    if (!state.network.enabled || state.panicked) return false;
-    const presence = makePresencePacket();
-    state.network.lastBroadcastAt = nowMs();
-    if (state.network.role === 'host') {
-      hostBroadcast({
-        type: 'presence',
-        protocol: CONFIG.networkProtocol,
-        peerId: state.network.localPeerId,
-        presence
-      });
-      return true;
-    }
-    if (state.network.role === 'client' && state.network.hostConnection?.open) {
-      try {
-        state.network.hostConnection.send({
-          type: 'state',
-          protocol: CONFIG.networkProtocol,
-          presence
-        });
-        return true;
-      } catch (_) {}
-    }
-    return false;
-  }
-
-  function networkHeartbeatTick() {
-    if (!state.network.enabled || state.panicked) return;
-    pruneRemotePresence();
-    const now = nowMs();
-
-    // requestAnimationFrame may pause/throttle in a background tab. This timer
-    // keeps a low-rate presence heartbeat alive so brief tab switches do not
-    // make remote Giblings vanish.
-    if (now - state.network.lastBroadcastAt >= CONFIG.networkHeartbeatMs) {
-      sendLocalPresenceNow();
-    }
-
-    if (state.network.role === 'host' && now - state.network.lastSnapshotAt >= CONFIG.networkSnapshotMs) {
-      broadcastPresenceSnapshot();
-    }
-  }
-
-  function ensureNetworkHeartbeat() {
-    if (state.network.heartbeatTimer) return;
-    state.network.heartbeatTimer = window.setInterval(networkHeartbeatTick, CONFIG.networkHeartbeatMs);
-  }
-
-  function stopNetworkHeartbeat() {
-    if (!state.network.heartbeatTimer) return;
-    clearInterval(state.network.heartbeatTimer);
-    state.network.heartbeatTimer = 0;
   }
 
   function sanitizeChatText(value) {
@@ -2552,27 +2462,15 @@
       return;
     }
     const peerId = String(conn.peer || 'unknown');
-    const incomingPublicId = String(metadata.publicId || '');
     let lastAcceptedAt = 0;
     conn.on('open', () => {
-      // A reconnect normally receives a fresh PeerJS ID. If an older transport
-      // for the same persistent Gibling is still hanging around, retire it.
-      if (incomingPublicId) {
-        for (const [otherPeerId, otherConn] of state.network.clients.entries()) {
-          if (otherPeerId === peerId) continue;
-          if (String(otherConn?.metadata?.publicId || '') !== incomingPublicId) continue;
-          state.network.clients.delete(otherPeerId);
-          try { otherConn.close(); } catch (_) {}
-          removeRemotePresence(otherPeerId);
-        }
-      }
-
       state.network.clients.set(peerId, conn);
       try {
         conn.send({
           type: 'snapshot',
           protocol: CONFIG.networkProtocol,
-          entries: buildPresenceSnapshotEntries()
+          entries: makeNetworkSnapshot(),
+          snapshotAt: Date.now()
         });
       } catch (_) {}
       hostBroadcast({ type: 'peer-joined', protocol: CONFIG.networkProtocol, peerId }, peerId);
@@ -2598,12 +2496,12 @@
       hostBroadcast({ type: 'presence', protocol: CONFIG.networkProtocol, peerId, presence }, peerId);
     });
     conn.on('close', () => {
-      // Ignore the late close event from a superseded connection. The newer
-      // PeerJS transport (same publicId) already owns this Gibling.
+      // Ignore a late close from a connection that has already been replaced.
       if (state.network.clients.get(peerId) !== conn) return;
       state.network.clients.delete(peerId);
       removeRemotePresence(peerId);
       hostBroadcast({ type: 'peer-left', protocol: CONFIG.networkProtocol, peerId }, peerId);
+      broadcastNetworkSnapshot(true);
       updateUi();
     });
     conn.on('error', error => {
@@ -2647,7 +2545,7 @@
       try { peer.reconnect?.(); } catch (_) {}
     });
     peer.on('close', () => {
-      if (state.network.enabled) scheduleNetworkElection('host closed');
+      if (state.network.enabled && generation === state.network.electionGeneration) scheduleNetworkElection('host closed');
     });
     updateUi();
   }
@@ -2682,46 +2580,41 @@
       });
       state.network.hostConnection = conn;
       conn.on('open', () => {
-        if (!state.network.enabled || generation !== state.network.electionGeneration) return;
-        if (state.network.hostConnection !== conn) return;
+        if (!state.network.enabled || generation !== state.network.electionGeneration || state.network.hostConnection !== conn) return;
         state.network.status = 'ONLINE — CLIENT';
         state.network.lastBroadcastAt = 0;
-        sendLocalPresenceNow();
+        // Reannounce immediately; do not wait for the next animation/update tick.
+        try { conn.send({ type: 'state', protocol: CONFIG.networkProtocol, presence: makePresencePacket() }); } catch (_) {}
         updateUi();
       });
-      conn.on('data', message => {
-        if (!state.network.enabled || generation !== state.network.electionGeneration) return;
-        if (state.network.hostConnection !== conn) return;
-        handleClientHostMessage(message);
-      });
+      conn.on('data', handleClientHostMessage);
       conn.on('close', () => {
-        if (!state.network.enabled || generation !== state.network.electionGeneration) return;
+        // destroyNetworkTransport() deliberately closes the previous connection.
+        // Only the currently-owned connection is allowed to trigger recovery.
         if (state.network.hostConnection !== conn) return;
         state.network.hostConnection = null;
-        destroyNetworkTransport(true);
-        scheduleNetworkElection('room host left');
+        if (state.network.enabled && generation === state.network.electionGeneration) {
+          destroyNetworkTransport(true);
+          scheduleNetworkElection('room host left');
+        }
       });
       conn.on('error', error => {
-        if (generation !== state.network.electionGeneration) return;
         state.network.error = String(error?.message || error);
       });
     });
     peer.on('disconnected', () => {
       if (!state.network.enabled || generation !== state.network.electionGeneration) return;
       state.network.status = 'CLIENT SIGNALING DISCONNECTED';
-      try { peer.reconnect?.(); } catch (_) {
-        scheduleNetworkElection('client signaling disconnected');
-      }
+      try { peer.reconnect?.(); } catch (_) {}
       updateUi();
     });
     peer.on('close', () => {
-      if (!state.network.enabled || generation !== state.network.electionGeneration) return;
-      scheduleNetworkElection('client peer closed');
+      if (state.network.enabled && generation === state.network.electionGeneration) scheduleNetworkElection('client peer closed');
     });
     peer.on('error', error => {
       state.network.error = String(error?.message || error);
       if (error?.type === 'peer-unavailable' || error?.type === 'network' || error?.type === 'server-error') {
-        if (state.network.enabled) scheduleNetworkElection(error.type);
+        if (state.network.enabled && generation === state.network.electionGeneration) scheduleNetworkElection(error.type);
       }
     });
   }
@@ -2772,9 +2665,6 @@
     state.network.publicId = state.network.publicId || getPersistentPublicId();
     state.network.status = 'STARTING';
     state.network.error = '';
-    state.network.lastBroadcastAt = 0;
-    state.network.lastSnapshotAt = 0;
-    ensureNetworkHeartbeat();
     if (persist) {
       settings.networkEnabled = true;
       saveSettings();
@@ -2788,7 +2678,6 @@
   function disableNetwork(persist = true) {
     state.network.enabled = false;
     state.network.status = 'OFF';
-    stopNetworkHeartbeat();
     if (persist) {
       settings.networkEnabled = false;
       saveSettings();
@@ -2808,13 +2697,16 @@
     updateVoice();
     pruneRemotePresence();
     const now = nowMs();
-
-    if (now - state.network.lastBroadcastAt >= CONFIG.networkBroadcastMs) {
-      sendLocalPresenceNow();
-    }
-
-    if (state.network.role === 'host' && now - state.network.lastSnapshotAt >= CONFIG.networkSnapshotMs) {
-      broadcastPresenceSnapshot();
+    if (state.network.role === 'host') broadcastNetworkSnapshot(false);
+    if (now - state.network.lastBroadcastAt < CONFIG.networkBroadcastMs) return;
+    state.network.lastBroadcastAt = now;
+    const presence = makePresencePacket();
+    if (state.network.role === 'host') {
+      hostBroadcast({ type: 'presence', protocol: CONFIG.networkProtocol, peerId: state.network.localPeerId, presence });
+    } else if (state.network.role === 'client' && state.network.hostConnection?.open) {
+      try {
+        state.network.hostConnection.send({ type: 'state', protocol: CONFIG.networkProtocol, presence });
+      } catch (_) {}
     }
   }
 
@@ -4347,8 +4239,7 @@
     state.ui.root.dataset.mode = state.panicked ? 'PANIC' : state.mode;
     if (state.ui.statusSim) state.ui.statusSim.innerHTML = `<strong>GeoFS</strong> ${state.supported ? '3.9 ready' : 'waiting'}`;
     if (state.ui.statusHead) state.ui.statusHead.innerHTML = `<strong>Tracking</strong> ${state.tracking.enabled ? (state.tracking.posePresent ? 'head + arms' : (state.tracking.poseLoading ? 'head + arms loading' : 'head / arms searching')) : 'off'}`;
-    const netCounts = networkPresenceCounts();
-    if (state.ui.statusNet) state.ui.statusNet.innerHTML = `<strong>Network</strong> ${state.network.enabled ? `${netCounts.active} active${netCounts.stale ? ` · ${netCounts.stale} stale` : ''}${netCounts.disconnected ? ` · ${netCounts.disconnected} reconnecting` : ''}` : 'off'}`;
+    if (state.ui.statusNet) state.ui.statusNet.innerHTML = `<strong>Network</strong> ${state.network.enabled ? `${state.network.remoteStates.size} peer${state.network.remoteStates.size === 1 ? '' : 's'}` : 'off'}`;
     state.ui.ground.disabled = state.panicked || state.mode !== 'AIRCRAFT' || !state.supported;
     state.ui.cockpit.disabled = state.panicked || state.mode === 'AIRCRAFT';
     if (state.ui.board) {
@@ -4390,9 +4281,8 @@
       `aircraft distance: ${distance === null ? 'n/a' : `${formatNumber(distance, 1)}m`}   board limit: ${CONFIG.boardRangeM}m`,
       `nearest boardable: ${state.nearestAircraft ? `${state.nearestAircraft.kind}:${state.nearestAircraft.label} @ ${formatNumber(state.nearestAircraft.distance, 1)}m` : 'none'}`,
       `passenger target: ${state.passenger.targetId ? `${state.passenger.targetLabel} [${state.passenger.targetId}] · ${state.passenger.poseSource} · seat=${state.passenger.seatOffset?.source || 'n/a'}` : 'none'}`,
-      `network: ${state.network.status} · role=${state.network.role} · id=${state.network.publicId || 'n/a'} · active=${netCounts.active} stale=${netCounts.stale} disconnected=${netCounts.disconnected}`,
-      `network recovery: recovered=${state.network.recoveries} · heartbeat=${state.network.heartbeatTimer ? 'ON' : 'OFF'} · snapshotAge=${state.network.lastSnapshotAt ? Math.round(nowMs() - state.network.lastSnapshotAt) + 'ms' : 'n/a'}`,
-      `network transport: localPeer=${state.network.localPeerId || 'n/a'} · hostClients=${state.network.clients.size} · ${state.network.error || 'no error'}`,
+      (() => { const c = remotePresenceCounts(); return `network: ${state.network.status} · role=${state.network.role} · id=${state.network.publicId || 'n/a'} · peers=${state.network.remoteStates.size} (active=${c.active} stale=${c.stale} hidden=${c.hidden})`; })(),
+      `network transport: localPeer=${state.network.localPeerId || 'n/a'} · hostClients=${state.network.clients.size} · reliable data + ${CONFIG.networkSnapshotMs}ms snapshots · ${state.network.error || 'no error'}`,
       `pointer lock: ${!!document.pointerLockElement}`,
       `last error: ${state.lastError || 'none'}`
     ];
@@ -4428,9 +4318,7 @@
             publicId: state.network.publicId,
             localPeerId: state.network.localPeerId,
             remotePeers: state.network.remoteStates.size,
-            presence: Object.freeze(networkPresenceCounts()),
-            recoveries: state.network.recoveries,
-            heartbeatActive: !!state.network.heartbeatTimer,
+            recovery: Object.freeze(remotePresenceCounts()),
             error: state.network.error
           }),
           tracking: Object.freeze({
