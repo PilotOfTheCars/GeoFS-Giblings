@@ -36,7 +36,7 @@ Giblings networking is separate from GeoFS native multiplayer; it does not write
 
 1. Disable older Giblings alpha/development scripts. Running two versions at once is a very effective way to create possessed Giblings.
 2. Open your userscript manager and create a new userscript.
-3. Paste the complete contents of `Giblings_1.0.1_Public.user.js` and save it.
+3. Paste the complete contents of `Giblings_1.0.2_Public.user.js` and save it.
 4. Open/reload **GeoFS 3.9**.
 5. The Giblings panel should appear in the upper-right area of the simulator.
 
@@ -98,6 +98,10 @@ Your passenger camera follows the remote aircraft while keeping an independent l
 
 `Alt + N` joins the Giblings public P2P layer. Compatible clients can share Gibling presence, position/state, colour, display name, head direction, compact arm pose and marshalling state.
 
+### 1.0.2 multiplayer recovery
+
+Version 1.0.2 hardens multiplayer presence against temporary packet gaps, background-tab throttling and reconnects. Remote Giblings now move through ACTIVE, STALE and DISCONNECTED recovery states instead of being permanently deleted after a short timeout. A low-rate heartbeat, periodic host snapshots, reliable PeerJS data transport, immediate reconnect re-announcement and persistent-ID migration allow a returning Gibling to recover without reloading GeoFS or toggling the network off and on.
+
 The **SOCIAL** tab contains Giblings text chat and proximity voice. This is separate from GeoFS chat.
 
 ## Proximity voice
@@ -151,6 +155,6 @@ Start by disabling every older Giblings userscript and reloading GeoFS. Check `F
 
 ## Version
 
-Current public build: **Giblings 1.0.1**.
+Current public build: **Giblings 1.0.2**.
 
 The earlier 2.x–5.x numbered builds were development/alpha builds. The public version line was intentionally reset for the first public release.

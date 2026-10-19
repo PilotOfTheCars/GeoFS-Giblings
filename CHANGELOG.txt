@@ -1,3 +1,17 @@
+GIBLINGS 1.0.2 — MULTIPLAYER PERSISTENCE / RECOVERY HOTFIX
+
+- Replaced the destructive 3.5-second remote-presence timeout with staged ACTIVE → STALE → DISCONNECTED recovery.
+- Remote presence is cached for up to two minutes unless the host receives an explicit peer-left event.
+- Added a low-rate background heartbeat so tab throttling is much less likely to make a Gibling vanish.
+- Added periodic host presence snapshots so clients can self-heal after missed updates.
+- Switched the client PeerJS data connection to reliable transport.
+- Re-announces local presence immediately when a client reconnects.
+- Uses persistent Giblings public IDs to migrate avatars across changing PeerJS transport IDs and avoid reconnect ghosts.
+- Added generation/connection guards so late close/data events from superseded transports cannot tear down a newer connection.
+- Added ACTIVE / STALE / DISCONNECTED counts and recovery information to diagnostics.
+- GeoFS native multiplayer remains untouched; this changes only the separate Giblings P2P layer.
+
+---
 GIBLINGS 1.0.1 — AVATAR ARM PATCH
 Owner: PilotOfTheCars
 
